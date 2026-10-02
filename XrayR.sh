@@ -5,7 +5,7 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-SCRIPT_RAW_BASE="https://raw.githubusercontent.com/zcw666806/XrayR-release/master"
+SCRIPT_RAW_BASE="https://raw.githubusercontent.com/billyking2000/Xxx/master"
 
 version="v1.0.0"
 
