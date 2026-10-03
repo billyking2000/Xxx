@@ -80,6 +80,11 @@ wget -N https://raw.githubusercontent.com/billyking2000/Xxx/master/install.sh &&
 ### 手动安装
 
 [手动安装教程](https://xrayr-project.github.io/XrayR-doc/xrayr-xia-zai-he-an-zhuang/install/manual)
+git clone https://github.com/billyking2000/Xxx
+cd Xxx
+go mod tidy
+go build -o XrayR -ldflags "-s -w"
+./XrayR --config config.yml
 
 ## 配置文件及详细使用教程
 
