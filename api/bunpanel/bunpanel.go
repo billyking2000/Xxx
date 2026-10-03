@@ -17,7 +17,7 @@ import (
 
 	"github.com/go-resty/resty/v2"
 
-	"github.com/XrayR-project/XrayR/api"
+	"github.com/billyking2000/Xxx/api"
 )
 
 type APIClient struct {
