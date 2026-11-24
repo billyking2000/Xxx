@@ -196,6 +196,7 @@ func (d *DefaultDispatcher) applyUserLimiter(ctx context.Context, inboundLink *t
 	sessionInbound.CanSpliceCopy = 3
 
 	user := sessionInbound.User
+	sessionInbound.CanSpliceCopy = 3
 	if user == nil || len(user.Email) == 0 {
 		return nil
 	}
