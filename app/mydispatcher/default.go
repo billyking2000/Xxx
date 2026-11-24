@@ -33,6 +33,27 @@ import (
 
 var errSniffingTimeout = newError("timeout on sniffing")
 
+var (
+	currentDispatcherMu sync.RWMutex
+	currentDispatcher   *DefaultDispatcher
+)
+
+func GetCurrentDispatcher() *DefaultDispatcher {
+	currentDispatcherMu.RLock()
+	defer currentDispatcherMu.RUnlock()
+	return currentDispatcher
+}
+
+func setCurrentDispatcher(d *DefaultDispatcher) {
+	currentDispatcherMu.Lock()
+	defer currentDispatcherMu.Unlock()
+	currentDispatcher = d
+}
+
+func (d *DefaultDispatcher) RecordOnlineAndLimit(ctx context.Context, link *transport.Link) error {
+	return d.applyUserLimiter(ctx, nil, link)
+}
+
 type cachedReader struct {
 	sync.Mutex
 	reader *pipe.Reader
@@ -143,6 +164,7 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.Limiter = limiter.New()
 	d.RuleManager = rule.New()
 	d.dns = dns
+	setCurrentDispatcher(d)
 	return nil
 }
 
@@ -161,6 +183,63 @@ func (*DefaultDispatcher) Close() error {
 	return nil
 }
 
+func (d *DefaultDispatcher) applyUserLimiter(ctx context.Context, inboundLink *transport.Link, outboundLink *transport.Link) error {
+	if d == nil || d.Limiter == nil {
+		return nil
+	}
+
+	sessionInbound := session.InboundFromContext(ctx)
+	if sessionInbound == nil {
+		return nil
+	}
+	// Disable splice to avoid Vision/REALITY bypassing stats path
+	sessionInbound.CanSpliceCopy = 3
+
+	user := sessionInbound.User
+	if user == nil || len(user.Email) == 0 {
+		return nil
+	}
+
+	ipStr := ""
+	if sessionInbound.Source.IsValid() && sessionInbound.Source.Address != nil {
+		ipStr = sessionInbound.Source.Address.IP().String()
+	}
+
+	// Speed Limit and Device Limit
+	bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, ipStr)
+	if reject {
+		errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
+		if outboundLink != nil {
+			if outboundLink.Writer != nil {
+				common.Close(outboundLink.Writer)
+			}
+			if outboundLink.Reader != nil {
+				common.Interrupt(outboundLink.Reader)
+			}
+		}
+		if inboundLink != nil {
+			if inboundLink.Writer != nil {
+				common.Close(inboundLink.Writer)
+			}
+			if inboundLink.Reader != nil {
+				common.Interrupt(inboundLink.Reader)
+			}
+		}
+		return newError("Devices reach the limit: ", user.Email)
+	}
+
+	if ok && bucket != nil {
+		if inboundLink != nil && inboundLink.Writer != nil {
+			inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, bucket)
+		}
+		if outboundLink != nil && outboundLink.Writer != nil {
+			outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, bucket)
+		}
+	}
+
+	return nil
+}
+
 func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link, error) {
 	opt := pipe.OptionsFromContext(ctx)
 	uplinkReader, uplinkWriter := pipe.New(opt...)
@@ -176,31 +255,17 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		Writer: downlinkWriter,
 	}
 
+	if err := d.applyUserLimiter(ctx, inboundLink, outboundLink); err != nil {
+		return nil, nil, err
+	}
+
 	sessionInbound := session.InboundFromContext(ctx)
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
-		// Disable splice to avoid Vision/REALITY bypassing stats path
-		sessionInbound.CanSpliceCopy = 3
 		user = sessionInbound.User
-		sessionInbound.CanSpliceCopy = 3
 	}
 
-	if user != nil && len(user.Email) > 0 {
-		// Speed Limit and Device Limit
-		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
-		if reject {
-			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
-			common.Close(outboundLink.Writer)
-			common.Close(inboundLink.Writer)
-			common.Interrupt(outboundLink.Reader)
-			common.Interrupt(inboundLink.Reader)
-			return nil, nil, newError("Devices reach the limit: ", user.Email)
-		}
-		if ok {
-			inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, bucket)
-			outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, bucket)
-		}
-
+	if user != nil && len(user.Email) > 0 && d.policy != nil && d.stats != nil {
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
@@ -312,6 +377,9 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if !destination.IsValid() {
 		return newError("Dispatcher: Invalid destination.")
 	}
+	if err := d.applyUserLimiter(ctx, nil, outbound); err != nil {
+		return err
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		outbounds = []*session.Outbound{{}}
@@ -408,6 +476,12 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	// with the new Xray-core version
 
 	var handler outbound.Handler
+
+	if disp := GetCurrentDispatcher(); disp != nil {
+		_ = disp.applyUserLimiter(ctx, nil, link)
+	} else {
+		_ = d.applyUserLimiter(ctx, nil, link)
+	}
 
 	// Check if domain and protocol hit the rule
 	sessionInbound := session.InboundFromContext(ctx)

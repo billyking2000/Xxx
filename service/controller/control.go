@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -15,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 
 	"github.com/XrayR-project/XrayR/api"
+	"github.com/XrayR-project/XrayR/app/mydispatcher"
 	"github.com/XrayR-project/XrayR/common/limiter"
 )
 
@@ -23,7 +25,8 @@ func (c *Controller) removeInbound(tag string) error {
 	return err
 }
 
-// statsOutboundWrapper wraps outbound.Handler to ensure user downlink traffic is counted.
+// statsOutboundWrapper wraps outbound.Handler to ensure user downlink traffic is counted
+// and online device IP / rate limits are recorded when dispatcher bypasses mydispatcher.
 type statsOutboundWrapper struct {
 	outbound.Handler
 	pm policy.Manager
@@ -34,6 +37,19 @@ func (w *statsOutboundWrapper) Dispatch(ctx context.Context, link *transport.Lin
 	// Disable kernel splice to avoid Vision/REALITY bypassing userland stats path
 	if sess := session.InboundFromContext(ctx); sess != nil {
 		sess.CanSpliceCopy = 3
+	}
+	if disp := mydispatcher.GetCurrentDispatcher(); disp != nil {
+		if err := disp.RecordOnlineAndLimit(ctx, link); err != nil {
+			if link != nil {
+				if link.Writer != nil {
+					common.Close(link.Writer)
+				}
+				if link.Reader != nil {
+					common.Interrupt(link.Reader)
+				}
+			}
+			return
+		}
 	}
 	w.Handler.Dispatch(ctx, link)
 }
@@ -67,7 +83,7 @@ func (c *Controller) addOutbound(config *core.OutboundHandlerConfig) error {
 	if !ok {
 		return fmt.Errorf("not an InboundHandler: %s", err)
 	}
-	// Wrap outbound handler to ensure downlink stats are always counted (e.g., REALITY/VLESS cases)
+	// Wrap outbound handler to ensure downlink stats and online device tracking are counted
 	handler = &statsOutboundWrapper{Handler: handler, pm: c.pm, sm: c.stm}
 	if err := c.obm.AddHandler(context.Background(), handler); err != nil {
 		return err
